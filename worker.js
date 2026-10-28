@@ -3,14 +3,16 @@ ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/di
 const TPL = [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]];
 let det, rec, ep;
 
-async function init() {
+async function mk(list, eps) {
+  let err;
+  for (const s of list) { try { return await ort.InferenceSession.create(typeof s === 'string' ? s : new Uint8Array(s), { executionProviders: eps }); } catch (e) { err = e; } }
+  throw err;
+}
+async function init(m) { // 手元から渡されたモデル > models/ の大きい方 > 小さい方
+  const dets = m.det ? [m.det] : ['models/det_10g.onnx', 'models/det_500m.onnx'];
+  const recs = m.rec ? [m.rec] : ['models/w600k_r50.onnx', 'models/w600k_mbf.onnx'];
   for (const eps of [['webgpu', 'wasm'], ['wasm']]) {
-    try {
-      det = await ort.InferenceSession.create('models/det_500m.onnx', { executionProviders: eps });
-      rec = await ort.InferenceSession.create('models/w600k_mbf.onnx', { executionProviders: eps });
-      ep = eps[0];
-      return;
-    } catch (e) { if (eps.length === 1) throw e; }
+    try { det = await mk(dets, eps); rec = await mk(recs, eps); ep = eps[0]; return; } catch (e) { if (eps.length === 1) throw e; }
   }
 }
 
@@ -74,7 +76,7 @@ async function embed(bmp, k) {
 
 onmessage = async ({ data: m }) => {
   try {
-    if (m.type === 'init') { await init(); postMessage({ type: 'ready', ep }); return; }
+    if (m.type === 'init') { await init(m); postMessage({ type: 'ready', ep }); return; }
     const faces = await detect(m.bmp, m.size, m.thr);
     if (m.type === 'ref') {
       const f = faces.sort((a, b) => (b.box[2] - b.box[0]) - (a.box[2] - a.box[0]))[0];

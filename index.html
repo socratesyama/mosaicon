@@ -19,16 +19,28 @@ progress{width:260px;vertical-align:middle}
 <fieldset><legend>1. 入力</legend>
 <label>動画 <input id="vf" type="file" accept="video/*"></label>
 <label>本人の顔写真（複数可） <input id="rf" type="file" accept="image/*" multiple></label>
+<label>高精度モデル(任意) <input id="mf" type="file" accept=".onnx" multiple></label>
 </fieldset>
 <fieldset><legend>2. 設定</legend>
-<label>処理速度 <select id="mode"><option value="2,0.1">ふつう</option><option value="4,0.1">速い（負荷大）</option><option value="1,0.2">そっと（負荷小）</option></select></label>
+<label>処理速度 <select id="mode"><option value="0.1,0">ふつう</option><option value="0.067,0">高精度（遅い）</option><option value="0.15,150">そっと（負荷小）</option></select></label>
 <label>検出サイズ <select id="dsz"><option>640</option><option selected>960</option><option>1280</option></select></label>
 <label>本人しきい値 <input id="thr" type="range" min="0.2" max="0.7" step="0.01" value="0.36"> <span id="thrv">0.36</span></label>
-<div><button id="go" class="pri" disabled>解析開始</button> <progress id="pg" value="0" max="1"></progress> <span id="log">モデル読み込み中…</span></div>
+<div><button id="go" class="pri" disabled>解析開始</button> <button id="stop" disabled>中止</button> <progress id="pg" value="0" max="1"></progress> <span id="log">モデル読み込み中…</span></div>
 <div style="color:var(--mut)">解析中はこのタブを表示したままにしてください（動画は外部に送信されません）。</div>
 </fieldset>
-<div id="stage"><video id="v" controls muted playsinline></video><canvas id="ov"></canvas></div>
+<div id="stage"><div id="vw" style="position:relative"><video id="v" muted playsinline></video><canvas id="ov"></canvas></div>
+<div style="display:flex;gap:8px;align-items:center;margin-top:6px"><button id="pp">再生/停止</button><input id="sk" type="range" min="0" max="1" step="0.0001" value="0" style="flex:1"><span id="tm">0:00</span><label style="margin:0"><input type="checkbox" id="pv"> モザイクをプレビュー</label></div></div>
 <table id="tb" style="display:none"><thead><tr><th>本人</th><th>ID</th><th>区間</th><th>検出数</th><th>類似度</th></tr></thead><tbody></tbody></table>
+<fieldset><legend>手動モザイク（後から追加）</legend>
+<button id="dm">描画モード: OFF</button> <button id="nw">新規作成に切替</button>
+<span style="color:var(--mut)">ONにして動画上をドラッグ → 現在位置から3秒の領域を作成。領域を選んだ状態で別の位置で描き直すとキーフレームが追加され、間は補間されます。</span>
+<div id="rg"></div></fieldset>
+<fieldset><legend>3. 要確認リスト（クリックでその場面へ）</legend><ul id="rv" style="margin:0;padding-left:18px;max-height:160px;overflow:auto"></ul></fieldset>
+<fieldset><legend>4. 書き出し</legend>
+<label>モザイクの粗さ <select id="cells"><option value="10">細かい</option><option value="7" selected>ふつう</option><option value="5">粗い</option></select></label>
+<label>画質 <select id="br"><option>4</option><option selected>8</option><option>16</option></select> Mbps</label>
+<div><button id="ex" class="pri" disabled>書き出し開始</button> <progress id="pg2" value="0" max="1"></progress> <span id="exlog" style="color:var(--mut)"></span></div>
+<div style="color:var(--mut)">等倍で再生しながら録画します（15分の動画なら約15分）。音声も含まれ、再生中は音が出ません。タブは表示したままに。保存先を選べるブラウザ（Chrome/Edge）ならディスクへ直接書き込むので、メモリを圧迫しません。</div></fieldset>
 <p><button id="sv" disabled>結果をJSON保存</button></p>
 <script>
 const $ = id => document.getElementById(id), v = $('v'), ov = $('ov'), cx = ov.getContext('2d');
@@ -36,13 +48,22 @@ const worker = new Worker('worker.js'), pending = new Map(); let rid = 0;
 const call = (m, tr) => new Promise((res, rej) => { m.id = ++rid; pending.set(rid, { res, rej }); worker.postMessage(m, tr || []); });
 worker.onmessage = ({ data: m }) => {
   if (m.type === 'ready') { $('log').textContent = '準備完了 (' + m.ep + ')'; ready(); return; }
+  if (m.error && m.id === undefined) { $('log').textContent = 'モデル読み込み失敗: ' + m.error; return; }
   const p = pending.get(m.id); if (!p) return; pending.delete(m.id); m.error ? p.rej(m.error) : p.res(m);
 };
-worker.postMessage({ type: 'init' });
 let isReady = false, refs = [], tracks = [], manual = new Set();
 const check = () => { $('go').disabled = !(isReady && $('vf').files[0] && $('rf').files.length); };
 const ready = () => { isReady = true; check(); };
-$('vf').onchange = () => { v.src = URL.createObjectURL($('vf').files[0]); $('stage').style.display = 'block'; check(); };
+$('vf').onchange = async () => {
+  regs = []; sel = null; renderRegs();
+  const f = $('vf').files[0]; v.src = URL.createObjectURL(f); $('stage').style.display = 'block'; check();
+  key = `${f.name}|${f.size}|${f.lastModified}`; const sv = await idbGet(key);
+  if (sv) {
+    tracks = sv.tracks; manual = new Set(sv.manual); nextId = sv.n; $('thr').value = sv.thr; $('thrv').textContent = sv.thr;
+    regs = sv.regs || []; rid2 = sv.rid || 1; renderRegs();
+    $('sv').disabled = false; $('log').textContent = '保存済みの解析結果を読み込みました（再解析も可）'; finalize(); startLoop();
+  }
+};
 $('rf').onchange = check;
 $('thr').oninput = () => { $('thrv').textContent = $('thr').value; manual.clear(); finalize(); };
 
@@ -88,7 +109,7 @@ function step(now, faces, maxLost) {
       return faces.map(f => {
         const io = iouF(pb, f.box), ap = f.emb ? 1 - dot(t.emb, f.emb) : 0.3;
         const dist = Math.hypot((pb[0] + pb[2] - f.box[0] - f.box[2]) / 2, (pb[1] + pb[3] - f.box[1] - f.box[3]) / 2);
-        return dist <= sz * (1 + 0.25 * Math.min(dtf, 30)) && (ap < 0.65 || io > 0.5) ? 0.5 * (1 - io) + 0.5 * ap : 1e3;
+        return dist <= sz * (0.5 + 0.2 * Math.min(dtf, 30)) && (f.emb ? (ap < 0.65 || io > 0.5) : io > 0.3) ? 0.4 * (1 - io) + 0.6 * ap : 1e3;
       });
     });
     for (const [i, j] of assign(cost)) { add(act[i], now, faces[j]); used.add(j); }
@@ -100,74 +121,201 @@ function step(now, faces, maxLost) {
 }
 function add(t, now, f) {
   const dt = Math.max(1e-3, now - t.last), pb = t.b[t.b.length - 1];
-  t.vel = t.vel.map((x, k) => 0.6 * x + 0.4 * (f.box[k] - pb[k]) / dt);
+  t.vel = t.vel.map((x, k) => 0.7 * x + 0.3 * (f.box[k] - pb[k]) / dt);
   t.t.push(now); t.b.push(f.box); t.q.push(f.score); t.s.push(f.emb ? simRef(f.emb) : -1); t.last = now;
   if (f.emb && f.score >= 0.6) { const e = t.emb.map((x, i) => 0.9 * x + 0.1 * f.emb[i]), n = Math.hypot(...e) + 1e-9; t.emb = e.map(x => x / n); }
 }
 
-// ---- 解析 ----
+// ---- 解析（シークで1コマずつ取得: 時刻とフレームが一致する）----
+const fm = s => `${(s / 60) | 0}:${String((s % 60) | 0).padStart(2, '0')}`;
+let abort = false;
+$('stop').onclick = () => { abort = true; };
+const seek = t => new Promise(r => { v.addEventListener('seeked', r, { once: true }); v.currentTime = t; });
 $('go').onclick = async () => {
-  $('go').disabled = true; tracks = []; nextId = 1; manual.clear();
-  refs = [];
+  $('go').disabled = true; $('stop').disabled = false; tracks = []; nextId = 1; manual.clear(); abort = false; refs = [];
   for (const f of $('rf').files) { const r = await call({ type: 'ref', bmp: await createImageBitmap(f), size: 960, thr: 0.4 }); if (r.emb) refs.push(r.emb); }
-  if (!refs.length) { $('log').textContent = '参照写真から顔を検出できませんでした'; $('go').disabled = false; return; }
-  const [rate, interval] = $('mode').value.split(',').map(Number), size = +$('dsz').value;
+  if (!refs.length) { $('log').textContent = '参照写真から顔を検出できませんでした'; $('go').disabled = false; $('stop').disabled = true; return; }
+  const [interval, nap] = $('mode').value.split(',').map(Number), size = +$('dsz').value, dur = v.duration;
   const k = v.videoWidth > 1920 ? 1920 / v.videoWidth : 1, rs = k < 1 ? { resizeWidth: 1920, resizeHeight: Math.round(v.videoHeight * k) } : undefined;
-  v.currentTime = 0; v.playbackRate = rate; v.controls = false;
-  let busy = false, last = -1, ended = new Promise(r => v.addEventListener('ended', r, { once: true }));
-  const cb = async (_, meta) => {
-    if (v.ended) return;
-    if (!busy && meta.mediaTime - last >= interval) {
-      busy = true; last = meta.mediaTime;
-      try {
-        const bmp = await createImageBitmap(v, rs), r = await call({ type: 'frame', bmp, size, thr: 0.4 }, [bmp]);
-        r.faces.forEach(f => { f.box = f.box.map(x => x / k); });
-        step(meta.mediaTime, r.faces, 1.5);
-      } catch (e) { console.error(e); }
-      busy = false;
-    }
-    $('pg').value = meta.mediaTime / v.duration; $('log').textContent = `解析中… トラック ${tracks.length}`;
-    v.requestVideoFrameCallback(cb);
-  };
-  v.requestVideoFrameCallback(cb); await v.play(); await ended;
-  v.controls = true; v.playbackRate = 1; v.currentTime = 0; $('pg').value = 1; $('go').disabled = false; $('sv').disabled = false;
-  finalize(); loop();
+  v.pause();
+  for (let t = 0; t < dur && !abort; t += interval) {
+    await seek(t);
+    try {
+      const bmp = await createImageBitmap(v, rs), r = await call({ type: 'frame', bmp, size, thr: 0.4 }, [bmp]);
+      r.faces.forEach(f => { f.box = f.box.map(x => x / k); });
+      step(t, r.faces, 1.5);
+    } catch (e) { console.error(e); }
+    if (nap) await new Promise(r => setTimeout(r, nap));
+    $('pg').value = t / dur; $('log').textContent = `解析中 ${fm(t)} / ${fm(dur)}  トラック ${tracks.length}`;
+  }
+  $('pg').value = 1; $('go').disabled = false; $('stop').disabled = true; $('sv').disabled = false; $('log').textContent = abort ? '中止しました（ここまでの結果を表示）' : '解析完了';
+  await seek(0); finalize(); startLoop();
 };
 
 // ---- 確認画面 ----
 const tscore = t => { const g = t.s.filter((s, i) => t.q[i] >= 0.5 && s >= -0.5).sort((a, b) => a - b).slice(-3); return g.length ? g.reduce((a, b) => a + b) / g.length : -1; };
 function finalize() {
   const thr = +$('thr').value;
-  tracks.forEach(t => { t.sc = tscore(t); if (!manual.has(t.id)) t.target = t.sc >= thr; });
+  tracks.forEach(t => { if (!t.sb) t.sb = smoothTrack(t); t.sc = tscore(t); if (!manual.has(t.id)) t.target = t.sc >= thr; });
   const rows = tracks.filter(t => t.t.length >= 3 || t.target).sort((a, b) => b.sc - a.sc);
+  review(); save(); canEx();
   const tb = $('tb').tBodies[0]; tb.innerHTML = ''; $('tb').style.display = '';
   const fm = s => `${(s / 60) | 0}:${String((s % 60) | 0).padStart(2, '0')}`;
   for (const t of rows) {
     const tr = tb.insertRow(); tr.className = t.target ? 't' : '';
     tr.innerHTML = `<td><input type="checkbox" ${t.target ? 'checked' : ''}></td><td>#${t.id}</td><td>${fm(t.t[0])}–${fm(t.t[t.t.length - 1])}</td><td>${t.t.length}</td><td>${t.sc.toFixed(2)}</td>`;
-    tr.querySelector('input').onclick = e => { e.stopPropagation(); t.target = e.target.checked; manual.add(t.id); tr.className = t.target ? 't' : ''; };
+    tr.querySelector('input').onclick = e => { e.stopPropagation(); t.target = e.target.checked; manual.add(t.id); review(); save(); canEx(); tr.className = t.target ? 't' : ''; };
     tr.onclick = () => { v.currentTime = Math.max(0, t.t[0] - 0.3); };
   }
 }
 function boxAt(t, x) {
-  if (x <= t.t[0]) return t.b[0]; const n = t.t.length; if (x >= t.t[n - 1]) return t.b[n - 1];
+  const B = t.sb || t.b, n = t.t.length; if (x <= t.t[0]) return B[0]; if (x >= t.t[n - 1]) return B[n - 1];
   let lo = 0, hi = n - 1; while (hi - lo > 1) { const m = (lo + hi) >> 1; t.t[m] <= x ? lo = m : hi = m; }
-  const w = (x - t.t[lo]) / (t.t[hi] - t.t[lo]); return t.b[lo].map((a, k) => a + (t.b[hi][k] - a) * w);
+  const w = (x - t.t[lo]) / (t.t[hi] - t.t[lo]); return B[lo].map((a, k) => a + (B[hi][k] - a) * w);
 }
-function loop() {
+// 検出のブレ対策: 中央値フィルタで外れ値除去 → 信頼度で重み付けした時間ガウス平滑（位置σ0.12秒/サイズσ0.3秒）
+function smoothTrack(t) {
+  const n = t.t.length;
+  const P = t.b.map((_, i) => {
+    const lo = Math.max(0, i - 2), hi = Math.min(n, i + 3);
+    const m = [0, 1, 2, 3].map(k => { const a = t.b.slice(lo, hi).map(b => b[k]).sort((x, y) => x - y); return a[a.length >> 1]; });
+    return [(m[0] + m[2]) / 2, (m[1] + m[3]) / 2, m[2] - m[0], m[3] - m[1]];
+  });
+  const gs = (i, k, sg) => { let a = 0, w = 0; for (let j = Math.max(0, i - 12); j < Math.min(n, i + 13); j++) { const d = (t.t[j] - t.t[i]) / sg; if (Math.abs(d) > 3) continue; const q = Math.exp(-0.5 * d * d) * (0.3 + t.q[j]); a += q * P[j][k]; w += q; } return a / w; };
+  return P.map((_, i) => { const cx = gs(i, 0, 0.12), cy = gs(i, 1, 0.12), w = gs(i, 2, 0.3), h = gs(i, 3, 0.3); return [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]; });
+}
+let regs = [], sel = null, rid2 = 1, drag = null, drawMode = false;
+const regBoxAt = (r, x) => {
+  const K = r.kf; if (!K.length || x < r.t0 || x > r.t1) return null;
+  if (K.length === 1 || x <= K[0].t) return K[0].b; const L = K[K.length - 1]; if (x >= L.t) return L.b;
+  let i = 0; while (K[i + 1].t < x) i++; const w = (x - K[i].t) / (K[i + 1].t - K[i].t); return K[i].b.map((a, k) => a + (K[i + 1].b[k] - a) * w);
+};
+const allBoxes = x => [...boxesAt(tracks.filter(t => t.target), x), ...regs.map(r => regBoxAt(r, x)).filter(Boolean).map(b => ({ b, raw: true }))];
+const canEx = () => { $('ex').disabled = !(tracks.some(t => t.target) || regs.length); };
+const pvc = document.createElement('canvas'), pvg = pvc.getContext('2d');
+function draw(now = v.currentTime) {
+  if (!v.videoWidth) return;
   if (ov.width !== v.videoWidth) { ov.width = v.videoWidth; ov.height = v.videoHeight; }
-  cx.clearRect(0, 0, ov.width, ov.height); const now = v.currentTime, lw = Math.max(2, ov.width / 400);
+  cx.clearRect(0, 0, ov.width, ov.height); const lw = Math.max(2, ov.width / 400);
   cx.font = `${lw * 7}px sans-serif`; cx.lineWidth = lw;
-  for (const t of tracks) {
-    if (t.t.length < 3 && !t.target) continue;
-    if (now < t.t[0] - 0.4 || now > t.t[t.t.length - 1] + 0.4) continue;
-    const b = boxAt(t, now); cx.strokeStyle = cx.fillStyle = t.target ? '#ff3b30' : '#34c759';
-    cx.strokeRect(b[0], b[1], b[2] - b[0], b[3] - b[1]); cx.fillText(`#${t.id} ${t.sc?.toFixed(2) ?? ''}`, b[0], Math.max(lw * 7, b[1] - 4));
+  if ($('pv').checked) { cx.drawImage(v, 0, 0); for (const o of allBoxes(now)) mosaic(cx, pvg, pvc, o.b, +$('cells').value, o.raw); }
+  else {
+    for (const t of tracks) {
+      if (t.t.length < 3 && !t.target) continue;
+      if (now < t.t[0] - 0.4 || now > t.t[t.t.length - 1] + 0.4) continue;
+      const b = boxAt(t, now); cx.strokeStyle = cx.fillStyle = t.target ? '#ff3b30' : '#34c759';
+      cx.strokeRect(b[0], b[1], b[2] - b[0], b[3] - b[1]); cx.fillText(`#${t.id} ${t.sc?.toFixed(2) ?? ''}`, b[0], Math.max(lw * 7, b[1] - 4));
+    }
+    for (const r of regs) { const b = regBoxAt(r, now); if (!b) continue; cx.strokeStyle = cx.fillStyle = '#0a84ff'; cx.strokeRect(b[0], b[1], b[2] - b[0], b[3] - b[1]); cx.fillText('手動#' + r.id, b[0], Math.max(lw * 7, b[1] - 4)); }
   }
-  requestAnimationFrame(loop);
+  if (drag) { cx.strokeStyle = '#ff9f0a'; cx.strokeRect(drag.x, drag.y, drag.x2 - drag.x, drag.y2 - drag.y); }
 }
+function loop() { v.requestVideoFrameCallback((_, m) => { draw(m.mediaTime); loop(); }); } // 表示中のフレームの時刻で描画
+v.addEventListener('seeked', () => draw());
+function renderRegs() {
+  const d = $('rg'); d.innerHTML = '';
+  for (const r of regs) {
+    const row = document.createElement('div'); row.style.cssText = 'padding:2px 0;' + (r.id === sel ? 'font-weight:600;' : '');
+    row.innerHTML = `手動#${r.id} <input type="number" step="0.1" min="0" style="width:70px" value="${r.t0.toFixed(1)}"> 〜 <input type="number" step="0.1" min="0" style="width:70px" value="${r.t1.toFixed(1)}"> 秒 <button>選択</button> <button>削除</button>`;
+    const [a, b] = row.querySelectorAll('input'), [bs, bd] = row.querySelectorAll('button');
+    a.onchange = () => { r.t0 = +a.value; save(); draw(); }; b.onchange = () => { r.t1 = +b.value; save(); draw(); };
+    bs.onclick = () => { sel = r.id; renderRegs(); v.currentTime = r.t0; };
+    bd.onclick = () => { regs = regs.filter(x => x !== r); if (sel === r.id) sel = null; renderRegs(); save(); canEx(); draw(); };
+    d.append(row);
+  }
+}
+function commit(b) {
+  const t = v.currentTime; let r = regs.find(x => x.id === sel);
+  if (!r) { r = { id: rid2++, t0: t, t1: Math.min(v.duration, t + 3), kf: [] }; regs.push(r); sel = r.id; }
+  r.kf = r.kf.filter(k => Math.abs(k.t - t) > 0.02); r.kf.push({ t, b }); r.kf.sort((p, q) => p.t - q.t);
+  r.t0 = Math.min(r.t0, t); r.t1 = Math.max(r.t1, t); renderRegs(); save(); canEx(); draw();
+}
+const pt = e => { const r = ov.getBoundingClientRect(); return [(e.clientX - r.left) * ov.width / r.width, (e.clientY - r.top) * ov.height / r.height]; };
+ov.onmousedown = e => { if (!drawMode) return; const p = pt(e); drag = { x: p[0], y: p[1], x2: p[0], y2: p[1] }; };
+ov.onmousemove = e => { if (drag) { const p = pt(e); drag.x2 = p[0]; drag.y2 = p[1]; draw(); } };
+ov.onmouseup = () => { if (!drag) return; const d = drag, b = [Math.min(d.x, d.x2), Math.min(d.y, d.y2), Math.max(d.x, d.x2), Math.max(d.y, d.y2)]; drag = null; if (b[2] - b[0] < 8 || b[3] - b[1] < 8) { draw(); return; } commit(b); };
+$('dm').onclick = () => { drawMode = !drawMode; $('dm').textContent = '描画モード: ' + (drawMode ? 'ON' : 'OFF'); ov.style.pointerEvents = drawMode ? 'auto' : 'none'; ov.style.cursor = drawMode ? 'crosshair' : ''; };
+$('nw').onclick = () => { sel = null; renderRegs(); };
+$('pv').onchange = () => draw(); $('cells').onchange = () => draw();
+$('pp').onclick = () => { v.paused ? v.play() : v.pause(); };
+$('sk').oninput = () => { v.currentTime = $('sk').value * v.duration; };
+v.addEventListener('timeupdate', () => { $('sk').value = v.currentTime / (v.duration || 1); $('tm').textContent = fm(v.currentTime); });
+
+// ---- 保存/再開 (IndexedDB) ----
+const idb = new Promise((res, rej) => { const r = indexedDB.open('fm', 1); r.onupgradeneeded = () => r.result.createObjectStore('s'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+const idbGet = k => new Promise(async res => { try { const r = (await idb).transaction('s').objectStore('s').get(k); r.onsuccess = () => res(r.result); r.onerror = () => res(null); } catch { res(null); } });
+let key = null, st, looping = false;
+const save = () => { clearTimeout(st); st = setTimeout(async () => { if (key) try { (await idb).transaction('s', 'readwrite').objectStore('s').put({ tracks: tracks.map(t => ({ ...t, sb: null })), manual: [...manual], thr: $('thr').value, n: nextId, regs, rid: rid2 }, key); } catch (e) { console.warn(e); } }, 500); };
+const startLoop = () => { if (!looping) { looping = true; loop(); } };
+
+// ---- 要確認リスト ----
+function review() {
+  const thr = +$('thr').value, it = [], T = tracks.filter(t => t.target).sort((a, b) => a.t[0] - b.t[0]);
+  T.forEach(t => { for (let i = 1; i < t.t.length; i++) { const g = t.t[i] - t.t[i - 1]; if (g > 0.6) it.push({ at: t.t[i - 1], txt: `#${t.id} 検出が${g.toFixed(1)}秒途切れ（補間で対応中）` }); } });
+  for (let i = 1; i < T.length; i++) { const e = T[i - 1].t[T[i - 1].t.length - 1], g = T[i].t[0] - e; if (g > 0.05) it.push({ at: e, txt: `#${T[i - 1].id}→#${T[i].id} に切替（空白${g.toFixed(1)}秒）` }); }
+  tracks.filter(t => !t.target && t.sc >= thr - 0.08 && t.t.length >= 3).forEach(t => it.push({ at: t.t[0], txt: `#${t.id} 境界の人物（類似度${t.sc.toFixed(2)}）` }));
+  it.sort((a, b) => a.at - b.at);
+  $('rv').innerHTML = ''; if (!it.length) $('rv').innerHTML = '<li>該当なし</li>';
+  for (const x of it) { const li = document.createElement('li'); li.style.cursor = 'pointer'; li.textContent = `${(x.at / 60) | 0}:${String((x.at % 60) | 0).padStart(2, '0')}  ${x.txt}`; li.onclick = () => { v.currentTime = Math.max(0, x.at - 1); }; $('rv').append(li); }
+}
+
+// ---- 書き出し ----
+function boxesAt(T, x) {
+  const S = [...T].sort((a, b) => a.t[0] - b.t[0]), out = [];
+  for (const t of S) if (x >= t.t[0] - 0.4 && x <= t.t[t.t.length - 1] + 0.4) out.push({ b: boxAt(t, x), raw: false });
+  for (let i = 1; i < S.length; i++) {
+    const a = S[i - 1], b = S[i], ae = a.t[a.t.length - 1], bs = b.t[0];
+    if (bs > ae && bs - ae <= 3 && x > ae && x < bs) { const w = (x - ae) / (bs - ae), A = a.b[a.b.length - 1], B = b.b[0]; out.push({ b: A.map((q, k) => q + (B[k] - q) * w), raw: false }); }
+  }
+  return out;
+}
+function mosaic(g, tg, tmp, b, cells, raw) {
+  const w = b[2] - b[0], h = b[3] - b[1], cxx = (b[0] + b[2]) / 2, cy = (b[1] + b[3]) / 2 - (raw ? 0 : h * 0.1), W = w * (raw ? 1 : 1.5), H = h * (raw ? 1 : 1.7);
+  const x = Math.max(0, Math.floor(cxx - W / 2)), y = Math.max(0, Math.floor(cy - H / 2));
+  const rw = Math.min(g.canvas.width, Math.ceil(cxx + W / 2)) - x, rh = Math.min(g.canvas.height, Math.ceil(cy + H / 2)) - y;
+  if (rw < 2 || rh < 2) return;
+  const bs = Math.max(4, Math.round(rw / cells)), sw = Math.max(1, Math.round(rw / bs)), sh = Math.max(1, Math.round(rh / bs));
+  tmp.width = sw; tmp.height = sh; tg.imageSmoothingQuality = 'high'; tg.drawImage(g.canvas, x, y, rw, rh, 0, 0, sw, sh);
+  g.imageSmoothingEnabled = false; g.drawImage(tmp, 0, 0, sw, sh, x, y, rw, rh); g.imageSmoothingEnabled = true;
+}
+let actx, adest;
+$('ex').onclick = async () => {
+  const cells = +$('cells').value, T = tracks.filter(t => t.target);
+  const mime = ['video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm'].find(m => MediaRecorder.isTypeSupported(m));
+  const ext = mime.startsWith('video/mp4') ? 'mp4' : 'webm';
+  let wr = null;
+  if (window.showSaveFilePicker) { try { wr = await (await showSaveFilePicker({ suggestedName: 'mosaic.' + ext })).createWritable(); } catch { return; } }
+  $('ex').disabled = true; $('go').disabled = true; ov.style.display = 'none';
+  const c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight;
+  const g = c.getContext('2d'), tmp = document.createElement('canvas'), tg = tmp.getContext('2d');
+  if (!actx) { actx = new AudioContext(); adest = actx.createMediaStreamDestination(); actx.createMediaElementSource(v).connect(adest); } // 端末のスピーカーには繋がない
+  await actx.resume();
+  const stream = c.captureStream(); adest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
+  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: +$('br').value * 1e6, audioBitsPerSecond: 192000 });
+  const parts = []; let chain = Promise.resolve();
+  rec.ondataavailable = e => { if (e.data.size) wr ? chain = chain.then(() => wr.write(e.data)) : parts.push(e.data); };
+  const stopped = new Promise(r => rec.onstop = r), ended = new Promise(r => v.addEventListener('ended', r, { once: true }));
+  v.muted = false; v.playbackRate = 1; v.currentTime = 0;
+  await new Promise(r => { v.onseeked = r; }); v.onseeked = null;
+  const draw = (_, m) => {
+    if (v.ended) return;
+    g.drawImage(v, 0, 0); for (const o of allBoxes(m.mediaTime)) mosaic(g, tg, tmp, o.b, cells, o.raw);
+    $('pg2').value = m.mediaTime / v.duration; $('exlog').textContent = `録画中 ${((m.mediaTime / v.duration) * 100).toFixed(0)}%`;
+    v.requestVideoFrameCallback(draw);
+  };
+  rec.start(1000); v.requestVideoFrameCallback(draw); await v.play(); await ended;
+  rec.stop(); await stopped; await chain;
+  if (wr) await wr.close(); else { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(parts, { type: mime })); a.download = 'mosaic.' + ext; a.click(); }
+  v.muted = true; v.currentTime = 0; ov.style.display = ''; $('pg2').value = 1; $('exlog').textContent = '完了'; $('ex').disabled = false; $('go').disabled = false;
+};
+const idbPut = async (k, val) => { const db = await idb; await new Promise((res, rej) => { const tx = db.transaction('s', 'readwrite'); tx.objectStore('s').put(val, k); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); };
+$('mf').onchange = async () => {
+  for (const f of $('mf').files) { const n = f.name.toLowerCase(), b = await f.arrayBuffer(); if (n.startsWith('det')) await idbPut('m:det', b); else if (n.includes('w600k') || n.includes('rec')) await idbPut('m:rec', b); }
+  $('log').textContent = 'モデルをこのブラウザに保存しました。再読み込みします'; setTimeout(() => location.reload(), 800);
+};
+(async () => { worker.postMessage({ type: 'init', det: await idbGet('m:det'), rec: await idbGet('m:rec') }); })();
 $('sv').onclick = () => {
-  const data = tracks.filter(t => t.t.length >= 3 || t.target).map(t => ({ id: t.id, target: t.target, score: +t.sc.toFixed(3), t: t.t.map(x => +x.toFixed(3)), b: t.b.map(b => b.map(Math.round)) }));
+  const data = tracks.filter(t => t.t.length >= 3 || t.target).map(t => ({ id: t.id, target: t.target, score: +t.sc.toFixed(3), t: t.t.map(x => +x.toFixed(3)), b: (t.sb || t.b).map(b => b.map(Math.round)) }));
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify({ version: 1, tracks: data })], { type: 'application/json' })); a.download = 'tracks.json'; a.click();
 };
 </script></body></html>
