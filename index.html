@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="robots" content="noindex">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>特定人物モザイク - 解析</title>
+<style>
+:root{--bg:#fff;--fg:#1c1c1e;--mut:#6b6b70;--line:#d9d9de;--acc:#d92d20}
+@media(prefers-color-scheme:dark){:root{--bg:#161618;--fg:#f2f2f4;--mut:#9a9aa2;--line:#333338}}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,"Hiragino Sans","Yu Gothic",sans-serif;max-width:1100px;margin-inline:auto}
+h1{font-size:18px}fieldset{border:1px solid var(--line);border-radius:8px;margin:0 0 12px;padding:10px 14px}
+legend{color:var(--mut)}label{display:inline-block;margin:4px 14px 4px 0}
+button{padding:6px 14px;border-radius:6px;border:1px solid var(--line);background:none;color:var(--fg);cursor:pointer}
+button.pri{background:var(--acc);border-color:var(--acc);color:#fff}button:disabled{opacity:.4}
+#stage{position:relative;display:none}#stage video{width:100%;display:block;background:#000}
+#ov{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+table{border-collapse:collapse;width:100%;margin-top:8px}td,th{border-bottom:1px solid var(--line);padding:4px 8px;text-align:left}
+tr.t td{color:var(--acc);font-weight:600}tbody tr{cursor:pointer}#log{color:var(--mut)}
+progress{width:260px;vertical-align:middle}
+</style></head><body>
+<h1>特定人物モザイク（解析・確認）</h1>
+<fieldset><legend>1. 入力</legend>
+<label>動画 <input id="vf" type="file" accept="video/*"></label>
+<label>本人の顔写真（複数可） <input id="rf" type="file" accept="image/*" multiple></label>
+</fieldset>
+<fieldset><legend>2. 設定</legend>
+<label>処理速度 <select id="mode"><option value="2,0.1">ふつう</option><option value="4,0.1">速い（負荷大）</option><option value="1,0.2">そっと（負荷小）</option></select></label>
+<label>検出サイズ <select id="dsz"><option>640</option><option selected>960</option><option>1280</option></select></label>
+<label>本人しきい値 <input id="thr" type="range" min="0.2" max="0.7" step="0.01" value="0.36"> <span id="thrv">0.36</span></label>
+<div><button id="go" class="pri" disabled>解析開始</button> <progress id="pg" value="0" max="1"></progress> <span id="log">モデル読み込み中…</span></div>
+<div style="color:var(--mut)">解析中はこのタブを表示したままにしてください（動画は外部に送信されません）。</div>
+</fieldset>
+<div id="stage"><video id="v" controls muted playsinline></video><canvas id="ov"></canvas></div>
+<table id="tb" style="display:none"><thead><tr><th>本人</th><th>ID</th><th>区間</th><th>検出数</th><th>類似度</th></tr></thead><tbody></tbody></table>
+<p><button id="sv" disabled>結果をJSON保存</button></p>
+<script>
+const $ = id => document.getElementById(id), v = $('v'), ov = $('ov'), cx = ov.getContext('2d');
+const worker = new Worker('worker.js'), pending = new Map(); let rid = 0;
+const call = (m, tr) => new Promise((res, rej) => { m.id = ++rid; pending.set(rid, { res, rej }); worker.postMessage(m, tr || []); });
+worker.onmessage = ({ data: m }) => {
+  if (m.type === 'ready') { $('log').textContent = '準備完了 (' + m.ep + ')'; ready(); return; }
+  const p = pending.get(m.id); if (!p) return; pending.delete(m.id); m.error ? p.rej(m.error) : p.res(m);
+};
+worker.postMessage({ type: 'init' });
+let isReady = false, refs = [], tracks = [], manual = new Set();
+const check = () => { $('go').disabled = !(isReady && $('vf').files[0] && $('rf').files.length); };
+const ready = () => { isReady = true; check(); };
+$('vf').onchange = () => { v.src = URL.createObjectURL($('vf').files[0]); $('stage').style.display = 'block'; check(); };
+$('rf').onchange = check;
+$('thr').oninput = () => { $('thrv').textContent = $('thr').value; manual.clear(); finalize(); };
+
+// ---- tracker (時間ベース) ----
+let nextId = 1;
+const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
+const iouF = (a, b) => {
+  const w = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0])), h = Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1])), i = w * h;
+  return i / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - i + 1e-9);
+};
+function hungarian(a) { // n<=m
+  const n = a.length, m = a[0].length, INF = 1e9, u = new Float64Array(n + 1), w = new Float64Array(m + 1), p = new Int32Array(m + 1), way = new Int32Array(m + 1);
+  for (let i = 1; i <= n; i++) {
+    p[0] = i; let j0 = 0; const mv = new Float64Array(m + 1).fill(INF), used = new Uint8Array(m + 1);
+    do {
+      used[j0] = 1; const i0 = p[j0]; let d = INF, j1 = 0;
+      for (let j = 1; j <= m; j++) if (!used[j]) {
+        const c = a[i0 - 1][j - 1] - u[i0] - w[j];
+        if (c < mv[j]) { mv[j] = c; way[j] = j0; }
+        if (mv[j] < d) { d = mv[j]; j1 = j; }
+      }
+      for (let j = 0; j <= m; j++) used[j] ? (u[p[j]] += d, w[j] -= d) : mv[j] -= d;
+      j0 = j1;
+    } while (p[j0] !== 0);
+    do { const j1 = way[j0]; p[j0] = p[j1]; j0 = j1; } while (j0);
+  }
+  const r = new Array(n).fill(-1); for (let j = 1; j <= m; j++) if (p[j]) r[p[j] - 1] = j - 1; return r;
+}
+function assign(cost) { // 行=トラック, 列=検出 → [[i,j]]
+  const n = cost.length, m = cost[0].length, out = [];
+  if (n <= m) hungarian(cost).forEach((j, i) => j >= 0 && out.push([i, j]));
+  else hungarian(cost[0].map((_, j) => cost.map(r => r[j]))).forEach((i, j) => i >= 0 && out.push([i, j]));
+  return out.filter(([i, j]) => cost[i][j] < 1e3);
+}
+const predict = (t, now) => { const dt = Math.min(now - t.last, 0.5), b = t.b[t.b.length - 1]; return b.map((x, k) => x + t.vel[k] * dt); };
+const simRef = e => Math.max(...refs.map(r => dot(r, e)));
+function step(now, faces, maxLost) {
+  const act = tracks.filter(t => now - t.last <= maxLost);
+  const used = new Set();
+  if (act.length && faces.length) {
+    const cost = act.map(t => {
+      const pb = predict(t, now), dtf = (now - t.last) * 30, sz = Math.max(pb[2] - pb[0], pb[3] - pb[1]);
+      return faces.map(f => {
+        const io = iouF(pb, f.box), ap = f.emb ? 1 - dot(t.emb, f.emb) : 0.3;
+        const dist = Math.hypot((pb[0] + pb[2] - f.box[0] - f.box[2]) / 2, (pb[1] + pb[3] - f.box[1] - f.box[3]) / 2);
+        return dist <= sz * (1 + 0.25 * Math.min(dtf, 30)) && (ap < 0.65 || io > 0.5) ? 0.5 * (1 - io) + 0.5 * ap : 1e3;
+      });
+    });
+    for (const [i, j] of assign(cost)) { add(act[i], now, faces[j]); used.add(j); }
+  }
+  faces.forEach((f, j) => {
+    if (used.has(j) || f.score < 0.5 || !f.emb) return;
+    tracks.push({ id: nextId++, t: [now], b: [f.box], s: [simRef(f.emb)], q: [f.score], emb: f.emb, last: now, vel: [0, 0, 0, 0] });
+  });
+}
+function add(t, now, f) {
+  const dt = Math.max(1e-3, now - t.last), pb = t.b[t.b.length - 1];
+  t.vel = t.vel.map((x, k) => 0.6 * x + 0.4 * (f.box[k] - pb[k]) / dt);
+  t.t.push(now); t.b.push(f.box); t.q.push(f.score); t.s.push(f.emb ? simRef(f.emb) : -1); t.last = now;
+  if (f.emb && f.score >= 0.6) { const e = t.emb.map((x, i) => 0.9 * x + 0.1 * f.emb[i]), n = Math.hypot(...e) + 1e-9; t.emb = e.map(x => x / n); }
+}
+
+// ---- 解析 ----
+$('go').onclick = async () => {
+  $('go').disabled = true; tracks = []; nextId = 1; manual.clear();
+  refs = [];
+  for (const f of $('rf').files) { const r = await call({ type: 'ref', bmp: await createImageBitmap(f), size: 960, thr: 0.4 }); if (r.emb) refs.push(r.emb); }
+  if (!refs.length) { $('log').textContent = '参照写真から顔を検出できませんでした'; $('go').disabled = false; return; }
+  const [rate, interval] = $('mode').value.split(',').map(Number), size = +$('dsz').value;
+  const k = v.videoWidth > 1920 ? 1920 / v.videoWidth : 1, rs = k < 1 ? { resizeWidth: 1920, resizeHeight: Math.round(v.videoHeight * k) } : undefined;
+  v.currentTime = 0; v.playbackRate = rate; v.controls = false;
+  let busy = false, last = -1, ended = new Promise(r => v.addEventListener('ended', r, { once: true }));
+  const cb = async (_, meta) => {
+    if (v.ended) return;
+    if (!busy && meta.mediaTime - last >= interval) {
+      busy = true; last = meta.mediaTime;
+      try {
+        const bmp = await createImageBitmap(v, rs), r = await call({ type: 'frame', bmp, size, thr: 0.4 }, [bmp]);
+        r.faces.forEach(f => { f.box = f.box.map(x => x / k); });
+        step(meta.mediaTime, r.faces, 1.5);
+      } catch (e) { console.error(e); }
+      busy = false;
+    }
+    $('pg').value = meta.mediaTime / v.duration; $('log').textContent = `解析中… トラック ${tracks.length}`;
+    v.requestVideoFrameCallback(cb);
+  };
+  v.requestVideoFrameCallback(cb); await v.play(); await ended;
+  v.controls = true; v.playbackRate = 1; v.currentTime = 0; $('pg').value = 1; $('go').disabled = false; $('sv').disabled = false;
+  finalize(); loop();
+};
+
+// ---- 確認画面 ----
+const tscore = t => { const g = t.s.filter((s, i) => t.q[i] >= 0.5 && s >= -0.5).sort((a, b) => a - b).slice(-3); return g.length ? g.reduce((a, b) => a + b) / g.length : -1; };
+function finalize() {
+  const thr = +$('thr').value;
+  tracks.forEach(t => { t.sc = tscore(t); if (!manual.has(t.id)) t.target = t.sc >= thr; });
+  const rows = tracks.filter(t => t.t.length >= 3 || t.target).sort((a, b) => b.sc - a.sc);
+  const tb = $('tb').tBodies[0]; tb.innerHTML = ''; $('tb').style.display = '';
+  const fm = s => `${(s / 60) | 0}:${String((s % 60) | 0).padStart(2, '0')}`;
+  for (const t of rows) {
+    const tr = tb.insertRow(); tr.className = t.target ? 't' : '';
+    tr.innerHTML = `<td><input type="checkbox" ${t.target ? 'checked' : ''}></td><td>#${t.id}</td><td>${fm(t.t[0])}–${fm(t.t[t.t.length - 1])}</td><td>${t.t.length}</td><td>${t.sc.toFixed(2)}</td>`;
+    tr.querySelector('input').onclick = e => { e.stopPropagation(); t.target = e.target.checked; manual.add(t.id); tr.className = t.target ? 't' : ''; };
+    tr.onclick = () => { v.currentTime = Math.max(0, t.t[0] - 0.3); };
+  }
+}
+function boxAt(t, x) {
+  if (x <= t.t[0]) return t.b[0]; const n = t.t.length; if (x >= t.t[n - 1]) return t.b[n - 1];
+  let lo = 0, hi = n - 1; while (hi - lo > 1) { const m = (lo + hi) >> 1; t.t[m] <= x ? lo = m : hi = m; }
+  const w = (x - t.t[lo]) / (t.t[hi] - t.t[lo]); return t.b[lo].map((a, k) => a + (t.b[hi][k] - a) * w);
+}
+function loop() {
+  if (ov.width !== v.videoWidth) { ov.width = v.videoWidth; ov.height = v.videoHeight; }
+  cx.clearRect(0, 0, ov.width, ov.height); const now = v.currentTime, lw = Math.max(2, ov.width / 400);
+  cx.font = `${lw * 7}px sans-serif`; cx.lineWidth = lw;
+  for (const t of tracks) {
+    if (t.t.length < 3 && !t.target) continue;
+    if (now < t.t[0] - 0.4 || now > t.t[t.t.length - 1] + 0.4) continue;
+    const b = boxAt(t, now); cx.strokeStyle = cx.fillStyle = t.target ? '#ff3b30' : '#34c759';
+    cx.strokeRect(b[0], b[1], b[2] - b[0], b[3] - b[1]); cx.fillText(`#${t.id} ${t.sc?.toFixed(2) ?? ''}`, b[0], Math.max(lw * 7, b[1] - 4));
+  }
+  requestAnimationFrame(loop);
+}
+$('sv').onclick = () => {
+  const data = tracks.filter(t => t.t.length >= 3 || t.target).map(t => ({ id: t.id, target: t.target, score: +t.sc.toFixed(3), t: t.t.map(x => +x.toFixed(3)), b: t.b.map(b => b.map(Math.round)) }));
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify({ version: 1, tracks: data })], { type: 'application/json' })); a.download = 'tracks.json'; a.click();
+};
+</script></body></html>
